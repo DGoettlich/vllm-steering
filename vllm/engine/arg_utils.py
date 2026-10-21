@@ -594,6 +594,7 @@ class EngineArgs:
     enable_steering: bool = False
     max_steering_configs: int = SteeringConfig.max_steering_configs
     max_dynamic_steering_configs: int = SteeringConfig.max_dynamic_steering_configs
+    max_neuron_clamps_per_layer: int = SteeringConfig.max_neuron_clamps_per_layer
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1393,6 +1394,10 @@ class EngineArgs:
             "--max-dynamic-steering-configs",
             **steering_kwargs["max_dynamic_steering_configs"],
         )
+        steering_group.add_argument(
+            "--max-neuron-clamps-per-layer",
+            **steering_kwargs["max_neuron_clamps_per_layer"],
+        )
 
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -2105,6 +2110,7 @@ class EngineArgs:
             SteeringConfig(
                 max_steering_configs=self.max_steering_configs,
                 max_dynamic_steering_configs=self.max_dynamic_steering_configs,
+                max_neuron_clamps_per_layer=self.max_neuron_clamps_per_layer,
             )
             if self.enable_steering
             else None

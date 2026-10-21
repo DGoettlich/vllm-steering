@@ -7,6 +7,11 @@ from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.neuron_clamp_types import (
+    NEURON_CLAMP_SUPPORTED_ARCHITECTURES,
+    NeuronClampValidationError,
+    validate_neuron_clamps_for_model,
+)
 from vllm.inputs import (
     EngineInput,
     PromptType,
@@ -169,6 +174,31 @@ class InputProcessor:
                 "is not enabled. Start the server with --enable-steering "
                 "to use per-request steering vectors."
             )
+        clamps = params.parsed_neuron_clamps
+        if clamps:
+            self._validate_neuron_clamps(clamps)
+
+    def _validate_neuron_clamps(self, clamps) -> None:
+        """Model/engine-dependent checks for ``neuron_clamps`` (HTTP 400)."""
+        if not self.steering_config:
+            raise NeuronClampValidationError(
+                "neuron_clamps were provided but steering is not enabled. "
+                "Start the server with --enable-steering to use neuron clamps."
+            )
+        architectures = set(self.model_config.architectures or ())
+        if not architectures & NEURON_CLAMP_SUPPORTED_ARCHITECTURES:
+            raise NeuronClampValidationError(
+                f"neuron_clamps are not supported for architectures "
+                f"{sorted(architectures)}; supported: "
+                f"{sorted(NEURON_CLAMP_SUPPORTED_ARCHITECTURES)}"
+            )
+        hf_text_config = self.model_config.hf_text_config
+        validate_neuron_clamps_for_model(
+            clamps,
+            num_hidden_layers=self.model_config.get_total_num_hidden_layers(),
+            intermediate_size=int(hf_text_config.intermediate_size),
+            max_clamps_per_layer=self.steering_config.max_neuron_clamps_per_layer,
+        )
 
     def _get_mm_identifier(
         self,

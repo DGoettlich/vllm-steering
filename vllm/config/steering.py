@@ -23,6 +23,13 @@ class SteeringConfig:
     ``0`` disables per-request dynamic overrides. See
     docs/design/dynamic_steering.md §5.2."""
 
+    max_neuron_clamps_per_layer: int = Field(default=16, ge=0)
+    """Width of the per-layer MLP neuron-clamp table: the maximum number
+    of ``neuron_clamps`` one request may place on a single decoder layer in
+    one phase. Clamp tables are sized ``(steering rows, this)`` per
+    supported layer. ``0`` disables neuron clamps (no buffers, no op in the
+    MLP forward). See docs/design/neuron_clamp.md."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -40,6 +47,9 @@ class SteeringConfig:
         # Dynamic pool size changes the steering-table buffer shape,
         # which is baked into compiled graphs.
         factors.append(self.max_dynamic_steering_configs)
+        # Clamp table width is baked into compiled graphs, and 0 removes
+        # the clamp op from the MLP forward entirely.
+        factors.append(self.max_neuron_clamps_per_layer)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
