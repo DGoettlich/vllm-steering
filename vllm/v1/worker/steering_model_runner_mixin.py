@@ -20,6 +20,11 @@ from vllm.config.steering_types import (
 )
 from vllm.exceptions import SteeringVectorError
 from vllm.logger import init_logger
+from vllm.model_executor.layers.neuron_clamp import (
+    NEURON_CLAMP_INDEX_ATTR,
+    NEURON_CLAMP_LOCAL_SIZE_ATTR,
+    get_neuron_clamp_module,
+)
 from vllm.model_executor.layers.steering import (
     HOOK_POINT_ANY_ACTIVE_ATTR,
     HOOK_POINT_MONITOR_ACTIVE_ATTR,
@@ -274,9 +279,7 @@ class SteeringModelRunnerMixin:
         pp_size = getattr(parallel_config, "pipeline_parallel_size", 1)
         if tp_size == 1 and pp_size == 1:
             install_steering_action_queue(SteeringActionQueue())
-            logger.info(
-                "dynamic steering action queue installed (tp=1, pp=1)"
-            )
+            logger.info("dynamic steering action queue installed (tp=1, pp=1)")
         else:
             install_steering_action_queue(None)
             logger.info(
@@ -377,6 +380,33 @@ class SteeringModelRunnerMixin:
                 device=table_device,
                 capture_sizes=list(capture_sizes) if capture_sizes else None,
             )
+
+            # Warm the MLP neuron-clamp kernel (emitted in every
+            # clamp-capable MLP forward) before CUDA-graph capture.
+            clamp_mlp = next(
+                (
+                    m
+                    for m in map(get_neuron_clamp_module, steerable.values())
+                    if m is not None
+                ),
+                None,
+            )
+            if clamp_mlp is not None:
+                from vllm.model_executor.layers.neuron_clamp_kernel import (
+                    warmup_neuron_clamp_kernel,
+                )
+
+                clamp_index = getattr(clamp_mlp, NEURON_CLAMP_INDEX_ATTR)
+                warmup_neuron_clamp_kernel(
+                    intermediate_size_local=int(
+                        getattr(clamp_mlp, NEURON_CLAMP_LOCAL_SIZE_ATTR)
+                    ),
+                    table_rows=int(clamp_index.shape[0]),
+                    max_clamps_per_layer=int(clamp_index.shape[1]),
+                    compute_dtype=compute_dtype,
+                    device=table_device,
+                    capture_sizes=list(capture_sizes) if capture_sizes else None,
+                )
 
     # -----------------------------------------------------------------------
     # Steerable-layer discovery and vector-spec validation
@@ -675,9 +705,7 @@ class SteeringModelRunnerMixin:
         # Apply-path counters by source (both transports).
         status["apply_stats"] = {
             source: dict(counts)
-            for source, counts in getattr(
-                self, "_dynamic_steering_stats", {}
-            ).items()
+            for source, counts in getattr(self, "_dynamic_steering_stats", {}).items()
         }
 
         # Dynamic-override pool occupancy.
@@ -730,9 +758,7 @@ class SteeringModelRunnerMixin:
         if mgr is not None:
             status["dynamic_scales"] = {
                 "global": dict(mgr._global_scales),
-                "config": {
-                    f"{h}:{p}": s for (h, p), s in mgr._config_scales.items()
-                },
+                "config": {f"{h}:{p}": s for (h, p), s in mgr._config_scales.items()},
                 "dynamic": {str(d): s for d, s in mgr._dynamic_scales.items()},
             }
         else:
@@ -757,9 +783,7 @@ class SteeringModelRunnerMixin:
                 "gpu_total_ms": round(stats.get("gpu_total_ms", 0.0), 3),
                 "gpu_max_ms": round(stats.get("gpu_max_ms", 0.0), 3),
                 "gpu_avg_ms": (
-                    round(stats["gpu_total_ms"] / gpu_steps, 3)
-                    if gpu_steps
-                    else None
+                    round(stats["gpu_total_ms"] / gpu_steps, 3) if gpu_steps else None
                 ),
                 "gpu_last_ms": stats.get("gpu_last_ms"),
                 "over_budget_steps": stats.get("over_budget_steps", 0),
@@ -1003,6 +1027,41 @@ class SteeringModelRunnerMixin:
         for config_hash, phase in pinned:
             mgr.release_config(config_hash, phase)
 
+    def _register_request_phase_config(
+        self,
+        sp: SamplingParams,
+        config_hash: int,
+        phase: str,
+    ) -> bool:
+        """Register a request's phase-effective config; True if registered.
+
+        The phase config is the resolved steering vectors plus the
+        phase-effective MLP neuron clamps — both are folded into
+        ``config_hash``. A config with clamps but no vectors (clamp-only)
+        still registers so its tokens get a row; only a phase with neither
+        (or ``config_hash == 0``) is skipped. The scheduler reserved the
+        row, so ``register_config`` raising is a scheduler bug.
+        """
+        mgr = self._steering_manager
+        if mgr is None or config_hash == 0:
+            return False
+        vectors = self._resolve_request_steering(sp, phase)
+        clamps = (
+            sp.effective_prefill_neuron_clamps
+            if phase == "prefill"
+            else sp.effective_decode_neuron_clamps
+        )
+        if not vectors and not clamps:
+            return False
+        mgr.register_config(
+            config_hash,
+            vectors or {},
+            phase=phase,
+            locally_owned_layers=self._locally_owned_layers,
+            neuron_clamps=clamps,
+        )
+        return True
+
     def _resolve_request_steering(
         self,
         sp: SamplingParams,
@@ -1210,8 +1269,7 @@ class SteeringModelRunnerMixin:
             return _reject("steering is not initialized on this worker")
         if mgr.max_dynamic_steering_configs <= 0:
             return _reject(
-                "dynamic override pool is disabled "
-                "(max_dynamic_steering_configs=0)"
+                "dynamic override pool is disabled (max_dynamic_steering_configs=0)"
             )
 
         existing_dyn_id = self._req_dynamic_decode.get(req_id)
@@ -1233,6 +1291,18 @@ class SteeringModelRunnerMixin:
             return _reject(
                 "request is still prefilling (overrides are decode-only; "
                 "prefill steering feeds prefix-cache keys)"
+            )
+        req_state = self.requests.get(req_id)
+        if (
+            req_state is not None
+            and req_state.sampling_params is not None
+            and req_state.sampling_params.effective_decode_neuron_clamps
+        ):
+            # Dynamic-override rows carry vectors only; routing a clamped
+            # request there would silently drop its decode neuron clamps.
+            return _reject(
+                "request has decode neuron clamps (dynamic override rows "
+                "cannot carry clamps)"
             )
         try:
             validate_steering_vectors(action.vectors, self._steerable_layers_cache)
@@ -1338,9 +1408,7 @@ class SteeringModelRunnerMixin:
         if action.probe is None:
             mgr.clear_monitor(action.hook, action.layer)
             return True
-        probe = torch.from_numpy(
-            np.ascontiguousarray(action.probe, dtype=np.float32)
-        )
+        probe = torch.from_numpy(np.ascontiguousarray(action.probe, dtype=np.float32))
         mgr.set_monitor(
             action.hook,
             action.layer,
@@ -1408,9 +1476,7 @@ class SteeringModelRunnerMixin:
         # (bounded memory; a re-appearing request simply re-reports — the
         # scheduler applies it idempotently).
         if self._req_decode_sig_reported:
-            for rid in [
-                r for r in self._req_decode_sig_reported if r not in seen
-            ]:
+            for rid in [r for r in self._req_decode_sig_reported if r not in seen]:
                 self._req_decode_sig_reported.pop(rid, None)
         return deltas
 
@@ -1532,6 +1598,11 @@ class SteeringModelRunnerMixin:
                         mon_buf = getattr(mod, HOOK_POINT_MONITOR_ACTIVE_ATTR[hp], None)
                         if mon_buf is not None:
                             mon_buf.zero_()
+                # Neuron-clamp tables are only written by populate (which
+                # does not run here): disable any layer still flagged.
+                self._steering_manager.clear_neuron_clamp_flags(
+                    self._steerable_layers_cache
+                )
                 self._steering_index_dirty = False
             # Nothing dynamic is active; revert any request still reported as
             # dynamically steered back to its admitted decode key.
@@ -1722,12 +1793,8 @@ class SteeringModelRunnerMixin:
                 token_scales_pinned.shape[0],
                 token_scales.shape[0],
             )
-            token_scales_pinned[:n_gate].copy_(
-                torch.from_numpy(gate_expanded[:n_gate])
-            )
-            token_scales[:n_gate].copy_(
-                token_scales_pinned[:n_gate], non_blocking=True
-            )
+            token_scales_pinned[:n_gate].copy_(torch.from_numpy(gate_expanded[:n_gate]))
+            token_scales[:n_gate].copy_(token_scales_pinned[:n_gate], non_blocking=True)
         else:
             n_gate = 0
         if n_gate < token_scales.shape[0]:
@@ -1752,12 +1819,8 @@ class SteeringModelRunnerMixin:
                 decode_mask_pinned.shape[0],
                 decode_mask.shape[0],
             )
-            decode_mask_pinned[:n_mask].copy_(
-                torch.from_numpy(mask_expanded[:n_mask])
-            )
-            decode_mask[:n_mask].copy_(
-                decode_mask_pinned[:n_mask], non_blocking=True
-            )
+            decode_mask_pinned[:n_mask].copy_(torch.from_numpy(mask_expanded[:n_mask]))
+            decode_mask[:n_mask].copy_(decode_mask_pinned[:n_mask], non_blocking=True)
         else:
             n_mask = 0
         if n_mask < decode_mask.shape[0]:
@@ -1805,15 +1868,9 @@ class SteeringModelRunnerMixin:
         if decode_hash != 0:
             req_state = self.requests.get(req_id)
             if req_state is not None and req_state.sampling_params is not None:
-                sp = req_state.sampling_params
-                effective_decode = self._resolve_request_steering(sp, "decode")
-                if effective_decode:
-                    mgr.register_config(
-                        decode_hash,
-                        effective_decode,
-                        phase="decode",
-                        locally_owned_layers=self._locally_owned_layers,
-                    )
+                self._register_request_phase_config(
+                    req_state.sampling_params, decode_hash, "decode"
+                )
 
         self._req_steering_phase[req_id] = "decode"
 
@@ -1860,15 +1917,7 @@ class SteeringModelRunnerMixin:
         prefill_hash = req_state.prefill_steering_config_hash
         if prefill_hash == 0 or sp is None:
             return
-        effective_prefill = self._resolve_request_steering(sp, "prefill")
-        if not effective_prefill:
-            return
-        mgr.register_config(
-            prefill_hash,
-            effective_prefill,
-            phase="prefill",
-            locally_owned_layers=self._locally_owned_layers,
-        )
+        self._register_request_phase_config(sp, prefill_hash, "prefill")
 
     # -----------------------------------------------------------------------
     # Hooks called from _update_states() / _update_streaming_request()
@@ -1921,26 +1970,16 @@ class SteeringModelRunnerMixin:
         sp = new_req_data.sampling_params
         if new_req_data.num_computed_tokens >= req_state.num_prompt_tokens:
             # Already past prefill — register decode config.
-            effective_decode = self._resolve_request_steering(sp, "decode")
-            if new_req_data.decode_steering_config_hash != 0 and effective_decode:
-                mgr.register_config(
-                    new_req_data.decode_steering_config_hash,
-                    effective_decode,
-                    phase="decode",
-                    locally_owned_layers=self._locally_owned_layers,
-                )
+            self._register_request_phase_config(
+                sp, new_req_data.decode_steering_config_hash, "decode"
+            )
             self._req_steering_phase[req_id] = "decode"
         else:
             # Normal: start in prefill; decode registered
             # on transition in _update_steering_buffers.
-            effective_prefill = self._resolve_request_steering(sp, "prefill")
-            if new_req_data.prefill_steering_config_hash != 0 and effective_prefill:
-                mgr.register_config(
-                    new_req_data.prefill_steering_config_hash,
-                    effective_prefill,
-                    phase="prefill",
-                    locally_owned_layers=self._locally_owned_layers,
-                )
+            self._register_request_phase_config(
+                sp, new_req_data.prefill_steering_config_hash, "prefill"
+            )
             self._req_steering_phase[req_id] = "prefill"
 
     def _refresh_streaming_steering(
@@ -1984,16 +2023,9 @@ class SteeringModelRunnerMixin:
         # Register new prefill config (streaming re-adds start
         # in prefill).
         sp = new_req_data.sampling_params
-        effective_prefill = (
-            self._resolve_request_steering(sp, "prefill") if sp is not None else None
-        )
-        if new_prefill_hash != 0 and sp is not None and effective_prefill:
-            mgr.register_config(
-                new_prefill_hash,
-                effective_prefill,
-                phase="prefill",
-                locally_owned_layers=self._locally_owned_layers,
-            )
+        if sp is not None and self._register_request_phase_config(
+            sp, new_prefill_hash, "prefill"
+        ):
             self._req_steering_phase[req_id] = "prefill"
         elif new_prefill_hash == 0 and new_decode_hash == 0:
             # No steering for this request anymore.
