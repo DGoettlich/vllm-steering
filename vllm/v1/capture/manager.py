@@ -1188,12 +1188,12 @@ class CaptureManager:
                         view.copy_(scratch, non_blocking=True)
                         scratch_pinned[key] = (pinned, view)
                     else:
-                        scratch_pinned[key] = (None, scratch)
+                        scratch_pinned[key] = (None, scratch.cpu() if scratch.device.type == "mps" else scratch)
                 cuda_event = torch.cuda.Event()
                 cuda_event.record(stream=self._capture_stream)
         else:
             for key, scratch in plan.scratch_gpu.items():
-                scratch_pinned[key] = (None, scratch)
+                scratch_pinned[key] = (None, scratch.cpu() if scratch.device.type == "mps" else scratch)
 
         packet = _DispatchPacket(
             entries=list(plan.entries),

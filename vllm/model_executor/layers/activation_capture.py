@@ -198,6 +198,7 @@ direct_register_custom_op(
     op_func=_capture_residual_impl,
     fake_impl=_capture_residual_fake,
     mutates_args=["hidden_states"],
+    extra_dispatch_keys=("MPS",),
 )
 
 
@@ -243,4 +244,5 @@ direct_register_custom_op(
     op_func=_capture_residual_add_impl,
     fake_impl=_capture_residual_add_fake,
     mutates_args=["a", "b"],
+    extra_dispatch_keys=("MPS",),
 )
